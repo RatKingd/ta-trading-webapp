@@ -88,25 +88,46 @@ if run:
     st.download_button("⬇️ הורד CSV", data=csv, file_name="recommendations.csv", mime="text/csv")
 
     st.subheader("5) גרף למניה נבחרת")
-    sel = st.selectbox("בחר מניה", options=picks['ticker'].tolist())
-    if sel in data:
-     df = data[sel].tail(250).copy()
+   # גרף למניה נבחרת
+sel = st.selectbox("בחר מניה", options=picks['ticker'].tolist())
+if sel in data:
+    df = data[sel].tail(250).copy()
 
-    # אם אין עמודת Date (כשהיא באינדקס), נכניס אותה כעמודה רגילה
+    # אם אין עמודת Date (כלומר היא באינדקס) – נכניס אותה כעמודה רגילה
     if 'Date' not in df.columns:
         df = df.reset_index()
 
+    # אם יש MultiIndex בעמודות (למשל ('Adj Close','POLI.TA')) – נשטח לשמות פשוטים
+    import pandas as pd
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [" ".join([str(x) for x in col if str(x) != ""]).strip()
+                      for col in df.columns]
+
+    # נמצא את עמודת המחיר: "Adj Close" או "Adj Close ..." (כשנוסף הסימבול בשם)
+    cand_cols = [c for c in df.columns if c.lower().startswith("adj close")]
+    y_col = cand_cols[0] if cand_cols else "Adj Close"
+
+    # ודא שקיימת עמודת Date
+    if 'Date' not in df.columns:
+        if 'index' in df.columns:
+            df = df.rename(columns={'index': 'Date'})
+        else:
+            df['Date'] = range(len(df))  # גיבוי
+
     # גרף מחיר
     st.plotly_chart(
-        px.line(df, x='Date', y='Adj Close', title=f"{sel} — מחיר"),
+        px.line(df, x='Date', y=y_col, title=f"{sel} — מחיר"),
         use_container_width=True
     )
 
-    # גרף RSI
-    st.plotly_chart(
-        px.line(df, x='Date', y='rsi', title="RSI (14)"),
-        use_container_width=True
-    )  
+    # גרף RSI (רק אם קיים)
+    rsi_col = [c for c in df.columns if c.lower().startswith("rsi")]
+    if rsi_col:
+        st.plotly_chart(
+            px.line(df, x='Date', y=rsi_col[0], title="RSI (14)"),
+            use_container_width=True
+        )
+
 
     # התראות במייל
     strong = last[last['prob_up'] >= alert_threshold].copy()
