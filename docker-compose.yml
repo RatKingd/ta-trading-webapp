@@ -1,0 +1,18 @@
+version: '3.8'
+services:
+  app:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      - APP_PASSWORD=${APP_PASSWORD}
+      - ALERTS_ENABLED=${ALERTS_ENABLED}
+      - ALERT_THRESHOLD=${ALERT_THRESHOLD}
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USERNAME=${SMTP_USERNAME}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - ALERTS_TO=${ALERTS_TO}
+      - TIMEZONE=${TIMEZONE}
+    volumes:
+      - ./cache:/app/cache
