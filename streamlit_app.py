@@ -87,11 +87,20 @@ if run:
     csv = picks[['ticker','Adj Close','prob_up','allocation_%','allocation_₪']].to_csv(index=False).encode('utf-8')
     st.download_button("⬇️ הורד CSV", data=csv, file_name="recommendations.csv", mime="text/csv")
 
-    st.subheader("5) גרף למניה נבחרת")
-   # גרף למניה נבחרת
-sel = st.selectbox("בחר מניה", options=picks['ticker'].tolist())
+  st.subheader("5) גרף למניה נבחרת")
+
+# גיבוי: אם 'picks' לא הוגדר/ריק, בחר מה-data
+import pandas as pd
+if ('picks' not in locals()) or (picks is None) or (isinstance(picks, pd.DataFrame) and picks.empty):
+    fallback = sorted(list(data.keys()))[:min(10, len(data))]  # עד 10 טיקרים כדי להציג גרף מהר
+    picks = pd.DataFrame({'ticker': fallback})
+
+options = picks['ticker'].tolist() if isinstance(picks, pd.DataFrame) else sorted(list(data.keys()))
+sel = st.selectbox("בחר מניה", options=options)
+
 if sel in data:
     df = data[sel].tail(250).copy()
+
 
     # אם אין עמודת Date (כלומר היא באינדקס) – נכניס אותה כעמודה רגילה
     if 'Date' not in df.columns:
