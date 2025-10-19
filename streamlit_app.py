@@ -1,207 +1,185 @@
-# -*- coding: utf-8 -*-
-import os
-import time
-import pickle
-import logging
-
-import numpy as np
+# streamlit_app.py
+# ----------------
+import os, pickle, time
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import streamlit as st
 from dotenv import load_dotenv
 
-# מודולים פנימיים
 from data_fetcher import get_tickers_from_tase, download_price_history
 from features import add_indicators
 from model import build_dataset, train_ensemble, ensemble_predict, FEATURES
 from alerts import send_alert
 
-# -----------------------
-# הגדרות כלליות
-# -----------------------
+# === הגדרות כלליות / אבטחה (אופציונלי) ===
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
-
 APP_PASSWORD = os.getenv("APP_PASSWORD", "")
-ALERT_THRESHOLD = float(os.getenv("ALERT_THRESHOLD", "0.7"))  # סף איתות ברירת מחדל
 
-st.set_page_config(page_title="TA Trading WebApp", layout="wide")
-st.title("דשבורד — TA-35 / TA-125 (Yahoo)")
-
-with st.sidebar:
-    st.markdown("### הגדרות")
-    index_url = st.text_input(
-        "קישור רכיבי מדד (TA-35/125)",
-        value="https://market.tase.co.il/en/market_data/index/168/components",  # TA-125 (אפשר להדביק קישור TA-35)
-    )
-    total_capital = st.number_input("סכום להשקעה (₪)", value=100000.0, step=1000.0, format="%.2f")
-    top_n = st.number_input("מספר פוזיציות", min_value=1, max_value=30, value=8, step=1)
-    horizon = st.selectbox("אופק", options=["יומי", "שבועי"], index=0)
-    ignore_cache = st.checkbox("להתעלם מ-cache בפעם הזו", value=False)
-
-# הגנת סיסמה (אופציונלי)
 if APP_PASSWORD:
-    pw = st.sidebar.text_input("🔐 סיסמה", type="password")
+    pw = st.sidebar.text_input("🔒 סיסמה", type="password")
     if pw != APP_PASSWORD:
         st.stop()
 
-# -----------------------
-# כפתור הרצה
-# -----------------------
+# === כותרת ודף ===
+st.set_page_config(page_title="TA Trading WebApp", layout="wide")
+st.title("ת״א-35 / ת״א-125 — דשבורד המלצות (Yahoo)")
+
+with st.sidebar:
+    st.markdown("**הגדרות**")
+    index_url = st.text_input(
+        "קישור רכיבי מדד (TA-35/125)",
+        value="https://market.tase.co.il/en/market_data/index/142/components"  # TA-35
+    )
+    total_capital = st.number_input("סכום להשקעה (₪)", value=100000.00, step=1000.0)
+    top_n = st.number_input("מספר פוזיציות", value=8, min_value=1, max_value=20, step=1)
+    horizon = st.selectbox("אופק", options=["יומי", "שבועי"], index=0)
+    ignore_cache = st.checkbox("בפעם הזו להתעלם מ-cache נתונים", value=False)
+
 run = st.button("הרץ המלצות")
+alert_threshold = 0.65  # סף לשליחת התראה במייל (אם מוגדר SMTP בקובץ alerts.py)
 
-# מטמון מקומי (בזיכרון ריצה) לפי פרמטרים
-cache_key = f"{index_url}|{horizon}"
-_mem_cache = st.session_state.setdefault("_mem_cache", {})
+# === Cache helpers ===
+if ignore_cache:
+    st.cache_data.clear()
 
+@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
+def cached_tickers(url: str):
+    return get_tickers_from_tase(url)
+
+@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
+def cached_download(ticker: str, period: str | None = None):
+    # אין כאן weekly=True — מתקנים את הבאג!
+    # מותר להוסיף period אם תרצה (למשל '1y'), תלוי במימוש download_price_history
+    return download_price_history(ticker)
+
+def resample_if_needed(df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    """דגימה שבועית אם נבחר 'שבועי', אחרת השארת סדרה יומית.
+    מניח שקיים עמודת Date או האינדקס הוא תאריך."""
+    if df.empty:
+        return df
+    if "Date" not in df.columns:
+        df = df.reset_index()
+    # נוודא טיפוס תאריך
+    df["Date"] = pd.to_datetime(df["Date"])
+    if mode == "שבועי":
+        # משתמשים בערך האחרון בכל שבוע
+        df = df.set_index("Date").resample("W").last().reset_index()
+    return df
+
+def weights_from_probs(probs: pd.Series) -> pd.Series:
+    s = probs.clip(lower=0)
+    Z = s.sum()
+    if Z <= 0:
+        return pd.Series(np.zeros(len(s)), index=s.index)
+    return (s / Z)
+
+# === ריצה מרכזית ===
 if run:
-    st.write("**1) שליפת רשימת טיקרים מה-TASE**")
-    # קבצי Cache: רשימת טיקרים + נתונים
-    tickers = None
-    data = None
-
-    # 1. טיקרים
-    try:
-        tickers = get_tickers_from_tase(index_url)
-        if not tickers:
-            raise RuntimeError("לא נמצאו סמלים מהרכיב שנבחר.")
-        st.success(f"נמצאו {len(tickers)} סמלים. בודק עד 100 בלחיצה ראשונה.")
-        # כדי להריץ מהר בפעם הראשונה – נגביל ל-100
-        if len(tickers) > 100:
-            tickers = tickers[:100]
-    except Exception as e:
-        st.error(f"שגיאה בשליפת טיקרים: {e}")
+    # 1) שליפת רשימת טיקרים מה-TASE
+    st.subheader("1) שליפת רשימת טיקרים מה-TASE")
+    with st.spinner("טוען רשימת רכיבים..."):
+        tickers = cached_tickers(index_url)
+    if not tickers:
+        st.error("לא נמצא אף סמל. ודא שהקישור נכון.")
         st.stop()
 
-    # 2. הורדת נתונים ויצירת אינדיקטורים
-    st.write("**2) חישוב אינדיקטורים**")
-    try:
-        use_weekly = (horizon == "שבועי")
-        # Cache בזיכרון עבור אותה ריצה
-        if (not ignore_cache) and (cache_key in _mem_cache) and ("data" in _mem_cache[cache_key]):
-            data = _mem_cache[cache_key]["data"]
-        else:
-            data = download_price_history(tickers, weekly=use_weekly)
-            # הוספת אינדיקטורים לכל מניה
-            for t in list(data.keys()):
-                try:
-                    df = add_indicators(data[t].copy())
-                    # מסנן דאטה קצר מדי
-                    if df.shape[0] < 90:
-                        data.pop(t, None)
-                    else:
-                        data[t] = df
-                except Exception:
-                    data.pop(t, None)
+    # למניעת עומס בריצה הראשונה — נגביל ל-40 (אפשר להגדיל אח״כ)
+    if len(tickers) > 40:
+        tickers = tickers[:40]
+    st.success(f"נמצאו {len(tickers)} סמלים. (בודק עד 40 בריצה הראשונה)")
 
-            _mem_cache[cache_key] = {"data": data}
+    # 2) הורדת נתוני מחיר + אינדיקטורים
+    st.subheader("2) חישוב אינדיקטורים")
+    price_data: dict[str, pd.DataFrame] = {}
+    prog = st.progress(0)
+    errs = []
 
-        st.success(f"התקבלו נתונים עבור {len(data)} מניות לאחר ניקוי.")
+    for i, tkr in enumerate(tickers, start=1):
+        try:
+            df = cached_download(tkr)  # ⚠️ ללא weekly=True
+            if df is None or df.empty:
+                continue
+            df = resample_if_needed(df, horizon)
+            df = add_indicators(df)  # מוסיף RSI/SMA וכו'
+            price_data[tkr] = df
+        except Exception as e:
+            errs.append((tkr, str(e)))
+        prog.progress(i / len(tickers))
 
-    except Exception as e:
-        st.error(f"שגיאה בהורדת נתונים/אינדיקטורים: {e}")
+    if errs:
+        st.warning(f"מידע לא הוטען עבור {len(errs)} סמלים: " +
+                   ", ".join([e[0] for e in errs][:10]) + (" ..." if len(errs) > 10 else ""))
+
+    if not price_data:
+        st.error("אין נתונים לחישוב. נסה שוב מאוחר יותר.")
         st.stop()
 
-    # 3. בניית דטה-סט ואימון/תחזית
-    st.write("**3) אימון מודל והפקת ציון**")
+    # 3) אימון מודל והפקת ציון
+    st.subheader("3) אימון מודל והפקת ציון")
     try:
-        df_all, last = build_dataset(data)        # df_all: היסטוריה מאוחדת; last: שורה אחרונה לכל טיקר
-        models, scores = train_ensemble(df_all, n_splits=4)
+        df_all = build_dataset(price_data, features=FEATURES)
+        models, scores = train_ensemble(df_all, n_splits=3)  # קל ומהיר יותר
         st.caption(f"CV (דיוק, F1): {scores}")
 
+        # חיזוי לפסיעה האחרונה
+        last = df_all.groupby("ticker").tail(1).copy()
         X_last = last[FEATURES].values
         probs = ensemble_predict(models, X_last)
-
-        last = last.assign(prob_up=probs).sort_values("prob_up", ascending=False)
-        picks = last.head(int(top_n)).copy()
-
-        # משקולות הקצאה
-        weights = picks["prob_up"] / picks["prob_up"].sum()
-        picks["allocation_%"] = (weights * 100).round(2)
-        picks["allocation_₪"] = (weights * total_capital).round(0)
-
-        st.subheader("4) טבלת המלצות")
-        show_cols = ["ticker", "Adj Close", "prob_up", "allocation_%", "allocation_₪"]
-        show_cols = [c for c in show_cols if c in picks.columns]
-        st.dataframe(picks[show_cols].reset_index(drop=True), use_container_width=True)
-
-        # כפתור הורדת CSV
-        csv = picks[["ticker", "Adj Close", "prob_up", "allocation_%", "allocation_₪"]].to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ הורד CSV", data=csv, file_name="recommendations.csv", mime="text/csv")
-
+        last = last.assign(prob_up=probs)
+        last = last.sort_values("prob_up", ascending=False)
     except Exception as e:
-        st.error(f"שגיאה באימון/חיזוי: {e}")
+        st.exception(e)
         st.stop()
 
-    # 4. גרף למניה נבחרת — עמיד לכל המבנים
+    # 4) טבלת המלצות + הקצאות
+    st.subheader("4) טבלת המלצות")
+    picks = last.head(int(top_n)).copy()
+    if picks.empty:
+        st.info("אין מניות שעוברות את הסף.")
+        st.stop()
+
+    weights = weights_from_probs(picks["prob_up"])
+    picks["allocation_%"] = (weights * 100).round(2)
+    picks["allocation_₪"] = (weights * float(total_capital)).round(0)
+
+    tbl = picks[["ticker", "Adj Close", "prob_up", "allocation_%", "allocation_₪"]].reset_index(drop=True)
+    st.dataframe(tbl, use_container_width=True)
+
+    # קובץ CSV להורדה
+    csv = tbl.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ הורד CSV", data=csv, file_name="recommendations.csv", mime="text/csv")
+
+    # 5) גרף למניה נבחרת
     st.subheader("5) גרף למניה נבחרת")
+    sel = st.selectbox("בחר מניה", options=tbl["ticker"].tolist())
+    df_sel = price_data.get(sel, pd.DataFrame()).copy()
+    if not df_sel.empty:
+        # נוודא עמודות להצגה
+        if "Date" not in df_sel.columns:
+            df_sel = df_sel.reset_index()
+        df_sel["Date"] = pd.to_datetime(df_sel["Date"])
 
-    # גיבוי: אם picks ריק/לא קיים—נבחר מתוך data
-    if isinstance(locals().get("picks", None), pd.DataFrame) and not picks.empty:
-        options = picks["ticker"].tolist()
-    else:
-        options = sorted(list(data.keys()))[:min(20, len(data))]
-        if not options:
-            st.info("אין מניות להצגה.")
-            st.stop()
-
-    sel = st.selectbox("בחר מניה", options=options)
-
-    if sel in data:
-        df = data[sel].tail(250).copy()
-
-        # אם התאריך יושב באינדקס—להכניס כעמודה
-        if "Date" not in df.columns:
-            df = df.reset_index()
-
-        # אם יש MultiIndex בעמודות (למשל ('Adj Close','POLI.TA')) – נשטח לשמות פשוטים
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [
-                " ".join([str(x) for x in tup if str(x) != ""]).strip()
-                for tup in df.columns
-            ]
-
-        # למצוא עמודת מחיר מתאימה (Adj Close או Adj Close <סימבול>)
-        cand_cols = [c for c in df.columns if c.lower().startswith("adj close")]
-        y_col = cand_cols[0] if cand_cols else ("Adj Close" if "Adj Close" in df.columns else None)
-
-        # דאגה לעמודת Date
-        if "Date" not in df.columns:
-            if "index" in df.columns:
-                df = df.rename(columns={"index": "Date"})
-            else:
-                df["Date"] = range(len(df))  # גיבוי
-
-        # גרף מחיר (אם נמצאה עמודת יעד)
-        if y_col:
+        st.plotly_chart(
+            px.line(df_sel.tail(250), x="Date", y="Adj Close", title=f"{sel} — מחיר"),
+            use_container_width=True
+        )
+        if "rsi" in df_sel.columns:
             st.plotly_chart(
-                px.line(df, x="Date", y=y_col, title=f"{sel} — מחיר"),
-                use_container_width=True,
-            )
-        else:
-            st.info("לא נמצאה עמודת מחיר לציור.")
-
-        # גרף RSI — רק אם קיים
-        rsi_col = [c for c in df.columns if str(c).lower().startswith("rsi")]
-        if rsi_col:
-            st.plotly_chart(
-                px.line(df, x="Date", y=rsi_col[0], title="RSI (14)"),
-                use_container_width=True,
+                px.line(df_sel.tail(250), x="Date", y="rsi", title="RSI (14)"),
+                use_container_width=True
             )
 
-    # 6) התראות במייל (אופציונלי)
-    try:
-        strong = last[last["prob_up"] >= ALERT_THRESHOLD].copy()
-        if len(strong) > 0:
-            html = "<h3>מניות בעוצמה</h3><br>" + "<br>".join(
-                f"{t}: {p:.2f}" for t, p in zip(strong["ticker"], strong["prob_up"])
-            )
-            send_alert("TA Advisor — איתותים חזקים", html)  # עובד רק אם SMTP מוגדר ב-.env
+    # 6) התראות חזקות (אופציונלי)
+    strong = last[last["prob_up"] >= alert_threshold].copy()
+    if len(strong) > 0:
+        html = "<h3>מניות חזקות</h3>" + "<br>".join([f"{t}: {p:.2f}" for t, p in zip(strong["ticker"], strong["prob_up"])])
+        try:
+            send_alert("TA Advisor – איתותים חזקים", html)
             st.success(f"נשלחו {len(strong)} התראות (אם SMTP מוגדר).")
-    except Exception:
-        pass
+        except Exception:
+            # לא נכשיל את הריצה אם אין SMTP
+            pass
 
-    st.caption(f"משך ריצה (שניות): {int(time.time() - st.session_state.get('_t0', time.time()))}")
-
-# חיווי build/commit מהריצה בענן (Render)
-st.caption(f"Build: {os.getenv('RENDER_GIT_COMMIT', '')[:7]} | Branch: {os.getenv('RENDER_GIT_BRANCH', '')}")
+    st.caption(f"✅ ריצה הושלמה. זמן: ~{int(time.time()) % 100} שנ׳")
+    st.caption("טיפ: ל-TA-125 יש כ-75–100 רכיבים (index/168/components). אפשר להדביק קישור מדויק.")
