@@ -90,9 +90,23 @@ if run:
     st.subheader("5) גרף למניה נבחרת")
     sel = st.selectbox("בחר מניה", options=picks['ticker'].tolist())
     if sel in data:
-        df = data[sel].tail(250).copy()
-        st.plotly_chart(px.line(df.reset_index(), x='Date', y='Adj Close', title=f"{sel} — מחיר"), use_container_width=True)
-        st.plotly_chart(px.line(df.reset_index(), x='Date', y='rsi', title="RSI (14)"), use_container_width=True)
+     df = data[sel].tail(250).copy()
+
+    # אם אין עמודת Date (כשהיא באינדקס), נכניס אותה כעמודה רגילה
+    if 'Date' not in df.columns:
+        df = df.reset_index()
+
+    # גרף מחיר
+    st.plotly_chart(
+        px.line(df, x='Date', y='Adj Close', title=f"{sel} — מחיר"),
+        use_container_width=True
+    )
+
+    # גרף RSI
+    st.plotly_chart(
+        px.line(df, x='Date', y='rsi', title="RSI (14)"),
+        use_container_width=True
+    )  
 
     # התראות במייל
     strong = last[last['prob_up'] >= alert_threshold].copy()
