@@ -1,0 +1,11 @@
+streamlit==1.36.0
+pandas
+numpy
+yfinance
+xgboost
+scikit-learn
+requests
+tqdm
+python-dotenv
+plotly
+apscheduler
