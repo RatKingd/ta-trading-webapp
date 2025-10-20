@@ -1,9 +1,11 @@
+# data_fetcher.py
+import time
 import requests
 import pandas as pd
 import yfinance as yf
 
-# כותרות כדי להקטין סיכוי לחסימת אתר
-_HDRS = {
+# כותרות שיעזרו לעקוף חסימות/CDN של TASE
+HDRS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
@@ -11,62 +13,83 @@ _HDRS = {
     "Pragma": "no-cache",
 }
 
-# רשימות נפילה (Fallback) אם שליפת רכיבי המדד נכשלת
-FALLBACK_TA35 = ["TEVA.TA", "LUMI.TA", "POLI.TA", "NICE.TA", "ICL.TA"]
-FALLBACK_TA125 = FALLBACK_TA35  # אפשר להרחיב בעתיד
+# רשימות גיבוי אם TASE לא מחזיר כלום (TA-125 / TA-35)
+FALLBACK_TA125 = ["TEVA.TA", "LUMI.TA", "POLI.TA", "NICE.TA", "ICL.TA"]
+FALLBACK_TA35  = ["TEVA.TA", "LUMI.TA", "POLI.TA", "NICE.TA", "ICL.TA"]
 
-def get_tickers_from_tase(index_url: str, timeout=20) -> list[str]:
+
+def get_tickers_from_tase(index_url: str, timeout: int = 20) -> list[str]:
     """
-    מנסה לשלוף את טבלאות רכיבי המדד מאתר הבורסה (קישור רכיבי המדד).
-    אם נכשל – מחזיר רשימת נפילה.
+    קורא את דף המדד מ-TASE ומחלץ סימבולים. במקרה של כישלון — יחזיר רשימת fallback.
     """
     try:
-        r = requests.get(index_url, headers=_HDRS, timeout=timeout)
+        r = requests.get(index_url, headers=HDRS, timeout=timeout)
         r.raise_for_status()
-        dfs = pd.read_html(r.text)  # דורש lxml
-        out = []
+        dfs = pd.read_html(r.text)
+        out: list[str] = []
         for df in dfs:
             cols = [str(c).lower() for c in df.columns]
-            # ננסה עמודות סבירות לשם הנייר
-            for candidate in ("Instrument Symbol", "Symbol", "Ticker", "נייר"):
-                if candidate in df.columns:
-                    syms = [str(x).strip() for x in df[candidate].dropna().tolist()]
-                    out = [s if s.endswith(".TA") else f"{s}.TA" for s in syms]
-                    break
-            if out:
-                break
+            # עמודות אפשריות
+            candidates = [c for c in df.columns if str(c).lower() in
+                          ("instrument symbol", "symbol", "ticker", "סימול")]
+            if candidates:
+                symcol = candidates[0]
+                syms = [str(x).strip() for x in df[symcol].dropna().tolist()]
+                # הוסף .TA אם חסר
+                out += [s if s.endswith(".TA") else f"{s}.TA" for s in syms if s]
+        out = sorted(list({s for s in out if s.endswith(".TA")}))
+        if out:
+            return out[:100]  # נגביל קצת
+    except Exception:
+        pass
 
-        if not out:
-            raise ValueError("no symbols column found")
+    # fallback לפי סוג הדף
+    if "index/142" in index_url or "TA-35" in index_url:
+        return FALLBACK_TA35
+    return FALLBACK_TA125
 
-        # ננקה כפילויות/ריקים
-        out = sorted({s for s in out if s and s != "nan"})
-        # נגביל ל-100 כדי לא להעמיס
-        return out[:100]
-    except Exception as e:
-        print("TASE fetch failed:", repr(e))
-        # קבע עפ"י ה-URL איזה נפילה לבחור
-        if "index/142" in index_url or "TA-35" in index_url:
-            return FALLBACK_TA35
-        return FALLBACK_TA125
 
-def download_price_history(tickers: list[str], period="1y", interval="1d") -> dict[str, pd.DataFrame]:
+def download_price_history(tickers: list[str], horizon: str = "daily") -> dict[str, pd.Series]:
     """
-    מוריד היסטוריית מחירים מ-Yahoo. בלי פרמטר weekly/דומיו כדי למנוע שגיאה.
-    מחזיר dict: ticker -> DataFrame עם עמודות ['Open','High','Low','Close','Adj Close','Volume'] ועמודת Date.
+    מוריד היסטוריית מחירים מ-Yahoo עבור רשימת טיקרים ומחזיר {ticker: Series(Adj Close)}.
+    תומך ביומי/שבועי/חודשי, כולל ריטריי ונרמול MultiIndex.
     """
-    out: dict[str, pd.DataFrame] = {}
-    for t in tickers:
-        try:
-            df = yf.download(t, period=period, interval=interval, auto_adjust=False, progress=False)
-            if df is None or df.empty:
-                continue
-            df = df.reset_index().rename(columns={"Date": "Date"})
-            # נעגל נפחים/מחירים לשקיפות
-            for c in ("Open", "High", "Low", "Close", "Adj Close"):
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-            out[t] = df
-        except Exception as e:
-            print("yfinance failed for", t, ":", repr(e))
+    horizon_map = {"daily": "1d", "weekly": "1wk", "monthly": "1mo"}
+    interval = horizon_map.get(horizon, "1d")
+
+    out: dict[str, pd.Series] = {}
+
+    df = pd.DataFrame()
+    for _ in range(3):
+        df = yf.download(
+            tickers=tickers,
+            period="3y",
+            interval=interval,
+            group_by="ticker",
+            auto_adjust=True,
+            threads=True,
+            progress=False,
+        )
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            break
+        time.sleep(2)
+
+    if df.empty:
+        return out
+
+    # MultiIndex: (TICKER, 'Adj Close')
+    if isinstance(df.columns, pd.MultiIndex):
+        for t in tickers:
+            col = (t, "Adj Close")
+            if col in df.columns:
+                ser = df[col].dropna()
+                if not ser.empty:
+                    out[t] = ser
+    else:
+        # יחיד
+        col = "Adj Close" if "Adj Close" in df.columns else "Close"
+        ser = df.get(col, pd.Series(dtype="float64")).dropna()
+        if len(tickers) == 1 and not ser.empty:
+            out[tickers[0]] = ser
+
     return out
