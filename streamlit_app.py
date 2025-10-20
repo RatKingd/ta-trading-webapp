@@ -1,148 +1,228 @@
 # streamlit_app.py
+# ----------------
+# אפליקציית Streamlit להצגת מניות TA-35/125, הורדת נתוני מחירים מ-Yahoo,
+# חישוב אינדיקטורים בסיסיים, יצירת טבלת המלצות וגרפים.
+
 import os
 import time
-import pickle
+from datetime import datetime, timezone
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+
 from dotenv import load_dotenv
 
-from data_fetcher import get_tickers_from_tase, download_price_history
+# פונקציות שהוגדרו בקובץ data_fetcher.py (הגרסה המלאה שסיפקתי לך)
+from data_fetcher import (
+    get_tase_tickers,           # (index_url: str) -> list[str]
+    download_price_history      # (tickers: list[str], period: str, interval: str) -> pd.DataFrame (MultiIndex)
+)
 
-# ------------------ הגדרות כלליות ------------------
+# ────────────────────────────────────────────────────────────────────────────────
+# הגדרות כלליות + טעינת סביבה
+# ────────────────────────────────────────────────────────────────────────────────
 load_dotenv()
+
 st.set_page_config(page_title="TA Trading WebApp", layout="wide")
+
+# סטייל קטן לימין-לשמאל
+st.markdown(
+    """
+    <style>
+    .block-container {direction: rtl;}
+    .stButton>button {direction: rtl;}
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# פונקציות עזר לאינדיקטורים
+# ────────────────────────────────────────────────────────────────────────────────
+def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = (delta.clip(lower=0)).ewm(alpha=1/period, adjust=False).mean()
+    down = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = up / down.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def enrich_indicators(wide_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    wide_df בפורמט wide per ticker:
+    עמודות לדוגמה: ('Adj Close','TEVA.TA'), ('Volume','TEVA.TA') וכו'.
+    לאחר ההעשרה מוחזר DataFrame חדש שנוח ל-plot (per selected ticker).
+    """
+    return wide_df  # בפורמט Wide נשאיר כפי שהוא; חישובים נעשים פר-מניה למטה.
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Sidebar — קלטים מהמשתמש
+# ────────────────────────────────────────────────────────────────────────────────
+st.sidebar.header("הגדרות")
+index_url = st.sidebar.text_input(
+    "קישור רכיבי מדד (TA-35/125)",
+    value="https://market.tase.co.il/en/market_data/index/142/components"  # TA-35
+)
+total_capital = st.sidebar.number_input("סכום להשקעה (₪)", min_value=0.0, value=100_000.0, step=1000.0, format="%.2f")
+num_positions = st.sidebar.number_input("מספר פוזיציות", min_value=1, max_value=30, value=8, step=1)
+
+tf = st.sidebar.selectbox("אופק", ["יומי", "שבועי"])  # מיפוי אח״כ ל-interval
+bypass_cache = st.sidebar.checkbox("בפעם הזו להתעלם מ-cache", value=False)
+
+run = st.sidebar.button("הרץ המלצות")
+
+# אפשרות לנעילת גישה בסיסית בסיסמה דרך ENV (לא חובה)
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+if APP_PASSWORD:
+    pw = st.sidebar.text_input("סיסמה", type="password")
+    if pw != APP_PASSWORD:
+        st.stop()
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Cache ניקוי לפי הצורך
+# ────────────────────────────────────────────────────────────────────────────────
+if bypass_cache:
+    try:
+        st.cache_data.clear()
+        st.sidebar.success("ה-cache נוקה להפעלה זו.")
+    except Exception:
+        pass
+
+# ────────────────────────────────────────────────────────────────────────────────
+# גוף האפליקציה
+# ────────────────────────────────────────────────────────────────────────────────
 st.title("תשבורת — TA-35 / TA-125 (Yahoo)")
 
-# ------------------ סרגל צד ------------------
-with st.sidebar:
-    st.markdown("### הגדרות")
-    index_url = st.text_input(
-        "קישור רכיבי מדד (TA-35/125)",
-        value="https://market.tase.co.il/en/market_data/index/142/components"  # TA-35 כברירת מחדל
-    )
-    total_capital = st.number_input("סכום להשקעה (₪)", min_value=0.0, value=100_000.0, step=1_000.0, format="%.2f")
-    top_n = st.number_input("מספר פוזיציות", min_value=1, max_value=20, value=8, step=1)
-    horizon_label = st.selectbox("אופק", options=["יומי", "שבועי", "חודשי"], index=0)
-    horizon = {"יומי": "daily", "שבועי": "weekly", "חודשי": "monthly"}[horizon_label]
-    ignore_cache = st.checkbox("בפעם הזו להתעלם מ-cache", value=False)
-    run_btn = st.button("הרץ המלצות")
-
-# ------------------ cache helpers ------------------
-@st.cache_data(show_spinner=False, ttl=3600)
-def _cached_tickers(url: str):
-    return get_tickers_from_tase(url)
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def _cached_prices(tickers: tuple[str, ...], horizon: str):
-    return download_price_history(list(tickers), horizon=horizon)
-
-def get_tickers(url: str):
-    return get_tickers_from_tase(url) if ignore_cache else _cached_tickers(url)
-
-def get_prices(tickers: list[str], horizon: str):
-    key = tuple(sorted(tickers))
-    return download_price_history(tickers, horizon) if ignore_cache else _cached_prices(key, horizon)
-
-# ------------------ חישובי אינדיקטורים פשוטים ------------------
-def compute_indicators(series: pd.Series) -> pd.DataFrame:
-    """מקבל סדרת מחירים ומחזיר DataFrame עם אינדיקטורים בסיסיים."""
-    df = series.to_frame("Adj Close").copy()
-    df["ret1"] = df["Adj Close"].pct_change()
-    df["sma20"] = df["Adj Close"].rolling(20).mean()
-    df["sma50"] = df["Adj Close"].rolling(50).mean()
-    # RSI בסיסי (14)
-    delta = df["Adj Close"].diff()
-    up = delta.clip(lower=0).rolling(14).mean()
-    down = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = up / down
-    df["rsi"] = 100 - (100 / (1 + rs))
-    return df.dropna()
-
-def score_ticker(df: pd.DataFrame) -> float:
-    """ציון בסיסי: שילוב מומנטום ויחסי ממוצעים (נורמליזציה 0..1)."""
-    if df.empty:
-        return 0.0
-    last = df.iloc[-1]
-    score = 0.0
-    # מעל הממוצעים?
-    score += 0.4 if last["Adj Close"] > last.get("sma50", 0) else 0.0
-    score += 0.2 if last["Adj Close"] > last.get("sma20", 0) else 0.0
-    # RSI באזור 50-70
-    if not np.isnan(last.get("rsi", np.nan)):
-        score += 0.4 * max(0.0, min((last["rsi"] - 50) / 20, 1.0))
-    return float(np.clip(score, 0, 1))
-
-# ------------------ הרצה ------------------
-if run_btn:
-    st.subheader("1) ‏שליפת רשימת טיקרים מ-TASE")
-    tickers = get_tickers(index_url)
-    if not tickers:
-        st.error("לא נמצאו סמלים. בדוק את ה-URL או נסה שוב.")
-        st.stop()
-    st.success(f"נמצאו {min(len(tickers),100)} סמלים. בודק עד 100 (לשיקולי עומס).")
-
-    st.subheader("2) הורדת נתונים וחישוב אינדיקטורים")
-    prices_map = get_prices(tickers[:100], horizon=horizon)
-
-    if not prices_map:
-        st.error("לא נמצאו נתוני מחירים (Yahoo החזיר ריק). נסה שוב עם cache כבוי או פחות טיקרים.")
+# (1) שליפת רשימת טיקרים
+with st.expander("1) שליפת רשימת טיקרים מה TASE", expanded=True):
+    try:
+        tickers = get_tase_tickers(index_url)
+        # כדי לא לעבור מגבלות של Yahoo, נגביל לגג 100 טיקרים לחישוב ראשוני
+        tickers = tickers[:100]
+        st.success(f"נמצאו {len(tickers)} סמלים. בדוק עד 100 (לשיקול עומס).")
+        if st.checkbox("להציג את הטיקרים שאותרו", value=False):
+            st.write(tickers)
+    except Exception as e:
+        st.error(f"שגיאה בשליפת טיקרים מהאתר. {e}")
         st.stop()
 
-    rows = []
-    per_ticker_frames: dict[str, pd.DataFrame] = {}
-    for t, ser in prices_map.items():
-        df = compute_indicators(ser)
-        per_ticker_frames[t] = df
-        rows.append({"ticker": t, "score": score_ticker(df)})
+# אם לא לחצו "הרץ", לא נמשיך לחישובים כדי לא להכביד
+if not run:
+    st.info("לחץ/י על 'הרץ המלצות' כדי להמשיך.")
+    st.stop()
 
-    if not rows:
-        st.error("לא נוצרו אינדיקטורים תקינים עבור הטיקרים.")
+# (2) הורדת נתונים וחישוב אינדיקטורים
+with st.expander("2) הורדת נתונים וחישוב אינדיקטורים", expanded=True):
+    interval = "1d" if tf == "יומי" else "1wk"
+    try:
+        # מורידים 6 חודשים כברירת מחדל — מספיק לחישובי SMA/RSI
+        prices_wide = download_price_history(tickers, period="6mo", interval=interval)
+        if prices_wide.empty:
+            st.error("לא נמצאו נתוני מחירים מ-Yahoo (שוב). נסה/י כיבוי cache, שינוי אופק, או פחות סמלים.")
+            st.stop()
+
+        # בסיס חישוב: ניקח את מחירי ה-Adj Close לסיום ונסנן טורים שאין בהם נתונים
+        adj_close = prices_wide["Adj Close"].copy()
+        adj_close = adj_close.dropna(how="all", axis=1)
+
+        if adj_close.empty:
+            st.error("לא התקבלו מחירי Adj Close תקינים מהנתונים שהורדו.")
+            st.stop()
+
+        # בוחרים את N המניות/טיקרים לחישוב (כאן: נסנן טיקרים שאין להם מספיק תצפיות)
+        min_points = 30 if interval == "1d" else 8  # דורש לפחות חודש + קצת, או 8 שבועות
+        enough_history = [t for t in adj_close.columns if adj_close[t].dropna().shape[0] >= min_points]
+        adj_close = adj_close[enough_history]
+
+        if adj_close.empty:
+            st.error("כל הטיקרים נפסלו בשל היסטוריה קצרה מדי. נסו אופק יומי/שבועי אחר או פחות טיקרים.")
+            st.stop()
+
+        st.success(f"נתונים הושגו עבור {adj_close.shape[1]} טיקרים.")
+    except Exception as e:
+        st.exception(e)
         st.stop()
 
-    scores = pd.DataFrame(rows).sort_values("score", ascending=False)
-    picks = scores.head(int(top_n)).copy()
-    # הקצאה יחסית לציון
-    s = picks["score"].sum()
-    if s > 0:
-        picks["allocation_%"] = (picks["score"] / s * 100).round(2)
-    else:
-        picks["allocation_%"] = (100 / len(picks)).round(2)
-    picks["allocation_₪"] = (picks["allocation_%"] / 100 * total_capital).round(0)
+    # ── חישוב אינדיקטורים בסיסיים לכל טיקר ───────────────────────────────────
+    # נבנה DataFrame מסכם אחרון לשקלול "ציון"
+    summary_rows = []
 
-    # לצורכי תצוגה נוסיף Adj Close האחרון אם קיים
-    last_prices = []
-    for t in picks["ticker"]:
-        df = per_ticker_frames.get(t, pd.DataFrame())
-        last_prices.append(float(df["Adj Close"].iloc[-1]) if not df.empty else np.nan)
-    picks["Adj Close"] = last_prices
+    for t in adj_close.columns:
+        s = adj_close[t].dropna()
+        if s.empty:
+            continue
 
-    st.success("חישוב הושלם.")
+        sma20 = s.rolling(20).mean()
+        sma50 = s.rolling(50).mean() if interval == "1d" else s.rolling(10).mean()  # הקבלה לשבועי
+        rsi = calc_rsi(s, 14)
 
-    st.subheader("3) אימון/ציון (בגרסת הבסיס – כבר חושב כ-score)")
-    st.write("הציון מחושב משילוב מומנטום וממוצעים נעים (0–1).")
+        last_price = float(s.iloc[-1])
+        last_sma50 = float(sma50.iloc[-1]) if not np.isnan(sma50.iloc[-1]) else np.nan
+        last_rsi = float(rsi.iloc[-1]) if not np.isnan(rsi.iloc[-1]) else np.nan
 
-    st.subheader("4) טבלת המלצות")
+        # ציון פשוט: 0..1 — חצי על יחס למחיר מול SMA50 וחצי על RSI מנורמל
+        comp1 = 1.0 if (not np.isnan(last_sma50) and last_price > last_sma50) else 0.0
+        comp2 = 0.0 if np.isnan(last_rsi) else np.clip((last_rsi - 30) / (70 - 30), 0, 1)
+        score = 0.5 * comp1 + 0.5 * comp2
+
+        summary_rows.append(
+            dict(ticker=t, last_price=last_price, rsi=last_rsi, score=score)
+        )
+
+    summary = pd.DataFrame(summary_rows).sort_values("score", ascending=False)
+    if summary.empty:
+        st.error("לא ניתן לחשב אינדיקטורים/ציון. בדקו שהנתונים תקינים או נסו אופק אחר.")
+        st.stop()
+
+    # בוחרים את N המובילות לפי הציון
+    picks = summary.head(int(num_positions)).reset_index(drop=True)
+
+    # הקצאת משקלות פרופורציונלית לציון (נרמול ל-100%)
+    weights = picks["score"].clip(lower=0)
+    if weights.sum() == 0:
+        weights[:] = 1.0
+    alloc = (weights / weights.sum()) * 100.0
+    picks["allocation_%"] = alloc.round(2)
+
+    # הוספת Adj Close מה-wide
+    picks["Adj Close"] = [adj_close[t].dropna().iloc[-1] if t in adj_close else np.nan
+                          for t in picks["ticker"]]
+
+    st.success(f"נבחרו {len(picks)} טיקרים מובילים לפי ציון משולב.")
     st.dataframe(
-        picks[["ticker", "Adj Close", "score", "allocation_%", "allocation_₪"]]
-            .reset_index(drop=True),
-        use_container_width=True,
+        picks[["ticker", "Adj Close", "score", "allocation_%"]],
+        use_container_width=True
     )
 
-    # הורדת CSV
-    csv = picks[["ticker", "Adj Close", "score", "allocation_%", "allocation_₪"]].to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ הורד CSV", data=csv, file_name="recommendations.csv", mime="text/csv")
+    # כפתור הורדת CSV
+    csv_bytes = picks[["ticker", "Adj Close", "score", "allocation_%"]].to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ הורד CSV", data=csv_bytes, file_name="recommendations.csv", mime="text/csv")
 
-    st.subheader("5) גרף למניה נבחרת")
-    sel = st.selectbox("בחר מניה", options=picks["ticker"].tolist())
-    df = per_ticker_frames.get(sel, pd.DataFrame()).tail(250).copy()
-    if not df.empty:
-        fig = px.line(df.reset_index(), x="Date", y="Adj Close", title=f"{sel} — מחיר")
-        st.plotly_chart(fig, use_container_width=True)
-        fig2 = px.line(df.reset_index(), x="Date", y="rsi", title="RSI (14)")
-        st.plotly_chart(fig2, use_container_width=True)
+# (3) גרפים
+with st.expander("3) גרף למניה נבחרת", expanded=True):
+    ticker_options = picks["ticker"].tolist()
+    if len(ticker_options) == 0:
+        st.info("אין מניות להצגה.")
     else:
-        st.info("אין נתונים להצגה לגרף.")
-else:
-    st.info("הגדר פרמטרים ולחץ על **הרץ המלצות**.")
+        sel = st.selectbox("בחר מניה", options=ticker_options)
+        if sel:
+            df = adj_close[[sel]].rename(columns={sel: "Adj Close"})
+            df = df.dropna().reset_index().rename(columns={"Date": "Date"})
+            # RSI נוסף לתצוגה:
+            rsi_series = calc_rsi(df["Adj Close"], 14)
+            out = pd.DataFrame({"Date": df["Date"], "Adj Close": df["Adj Close"], "rsi": rsi_series})
+
+            st.plotly_chart(
+                px.line(out, x="Date", y="Adj Close", title=f"{sel} — מחיר"),
+                use_container_width=True
+            )
+            st.plotly_chart(
+                px.line(out, x="Date", y="rsi", title="RSI (14)"),
+                use_container_width=True
+            )
+
+# (4) חיווי זמן
+st.caption(f"עודכן: {datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}")
