@@ -1,145 +1,163 @@
-# data_fetcher.py
-# ---------------
-# שליפת טיקרים מאתר TASE + הורדת היסטוריית מחירים מ-Yahoo בפורמט Wide:
-# עמודות בצורה MultiIndex: ('Adj Close','TEVA.TA'), ('Volume','TEVA.TA'), ...
+# streamlit_app.py
+# ----------------
+# TA Trading WebApp – UI נקי שמצייר מיידית,
+# ומבצע הורדות/חישובים רק לאחר לחיצה על כפתור, עם spinner/סטטוס.
 
 from __future__ import annotations
-import re
+import os
 import time
 from typing import List
 
-import requests
 import pandas as pd
-import yfinance as yf
+import plotly.express as px
+import streamlit as st
+from dotenv import load_dotenv
 
-# כותרות "אנושיות" כדי לעקוף חסימות/CDN
-_HDRS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-}
+from data_fetcher import get_tase_tickers, download_price_history
 
+# -------------------------------------------------
+# הגדרות בסיסיות ל־Streamlit
+# -------------------------------------------------
+st.set_page_config(page_title="TA Trading WebApp", layout="wide")
+load_dotenv()
 
-def _extract_symbols_from_tables(dfs: list[pd.DataFrame]) -> list[str]:
-    """מקבל רשימת טבלאות שנקראו מ-HTML ומחזיר סמלים עם סיומת .TA"""
-    out: list[str] = []
-    candidates = {"Instrument Symbol", "Symbol", "Ticker", "Instrument", "תוך מסחר", "סימול"}
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
 
-    for df in dfs:
-        if df is None or df.empty:
-            continue
+# -------------------------------------------------
+# UI בסיסי + אימות (מצויר מיידית)
+# -------------------------------------------------
+st.title("תשבורת — TA-35 / TA-125 (Yahoo)")
+if APP_PASSWORD:
+    pw = st.sidebar.text_input("🔐 סיסמה", type="password")
+    if pw != APP_PASSWORD:
+        st.info("הכנס סיסמה כדי להמשיך.")
+        st.stop()
 
-        # normalize headers
-        cols = [str(c).strip() for c in df.columns]
-        lower = [c.lower() for c in cols]
+with st.sidebar:
+    st.header("הגדרות:")
+    index_url = st.text_input(
+        "קישור רכיבי מדד (TA-35/125)",
+        value="https://market.tase.co.il/en/market_data/index/142/components",
+        help="הדבק את קישור רכיבי המדד מה-TASE",
+    )
+    total_capital = st.number_input("סכום להשקעה (₪)", min_value=0.0, value=100000.0, step=1000.0)
+    top_n = st.number_input("מספר פוזיציות", min_value=1, max_value=50, value=8, step=1)
+    horizon = st.selectbox("אופק", ["יומי", "שבועי"], index=0)
+    ignore_cache = st.checkbox("בפעם הזו להתעלם מ-cache", value=False)
+    run_btn = st.button("הרץ המלצות")
 
-        # חיפוש עמודת סמל אפשרית
-        target_idx = None
-        for i, c in enumerate(cols):
-            if c in candidates:
-                target_idx = i
-                break
-        if target_idx is None:
-            for i, c in enumerate(lower):
-                if "symbol" in c or "ticker" in c or "סימול" in c:
-                    target_idx = i
-                    break
-        if target_idx is None:
-            continue
+# מקום לתוצרים (כדי שהדף לא יהיה ריק)
+sec1 = st.container()
+sec2 = st.container()
+sec3 = st.container()
+sec4 = st.container()
+sec5 = st.container()
 
-        series = df.iloc[:, target_idx].dropna()
-        for raw in series.astype(str).tolist():
-            s = raw.strip().upper()
-            # ניקוי לכל מקרה
-            s = re.sub(r"[^A-Z\.]", "", s)
-            if not s:
-                continue
-            # הוספת סיומת .TA אם חסר
-            if not s.endswith(".TA"):
-                s = s + ".TA"
-            if s not in out:
-                out.append(s)
+# -------------------------------------------------
+# לוגיקה תרוץ רק לאחר לחיצה
+# -------------------------------------------------
+if not run_btn:
+    st.caption("לחץ על “הרץ המלצות” כדי להתחיל.")
+    st.stop()
 
-    return out
+# -------------------------------------------------
+# 1) שליפת רשימת טיקרים מה-TASE
+# -------------------------------------------------
+with sec1:
+    st.subheader("1) שליפת רשימת טיקרים מה-TASE")
+    with st.status("בודק ומושך עד 100 סמלים ראשונים…", expanded=False) as s:
+        tickers: List[str] = []
+        ok = False
+        try:
+            # גם אם האתר איטי – get_tase_tickers מגדיר timeout פנימי.
+            tickers = get_tase_tickers(index_url)[:100]
+            if tickers:
+                st.success(f"נמצאו {len(tickers)} סמלים. (בדוק עד 100 ראשונים)")
+                ok = True
+            else:
+                st.warning("לא נמצאו סמלים. בדוק את הקישור.")
+        except Exception as e:
+            st.error(f"שגיאה בשליפת טיקרים: {e}")
+        s.update(state="complete")
 
+    if not ok:
+        st.stop()
 
-def get_tase_tickers(index_url: str) -> List[str]:
-    """
-    קורא דף רכיבי מדד מה-TASE ומחזיר רשימת טיקרים בפורמט Yahoo (עם .TA).
-    """
-    resp = requests.get(index_url, headers=_HDRS, timeout=20)
-    resp.raise_for_status()
-
-    # pandas.read_html צפוי – אם עתידי ייעלם literal-html, נעטוף ב-StringIO אם צריך.
-    dfs = pd.read_html(resp.text)
-    symbols = _extract_symbols_from_tables(dfs)
-
-    # ביטחון: מסנן כפולים ומחזיר רשימה
-    symbols = pd.unique(pd.Series(symbols)).tolist()
-    return symbols
-
-
-def _to_field_first_wide(df: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
-    """
-    yfinance.download עם group_by='ticker' מחזיר MultiIndex ברמת (ticker, field).
-    כאן נהפוך ל-(field, ticker) כדי שיהיה נוח: wide['Adj Close'][<TICKER>]
-    תומך גם במקרה של טיקר יחיד.
-    """
-    if isinstance(df.columns, pd.MultiIndex):
-        wide = df.swaplevel(0, 1, axis=1).sort_index(axis=1)
+# -------------------------------------------------
+# 2) הורדת נתונים וחישוב אינדיקטורים
+# -------------------------------------------------
+with sec2:
+    st.subheader("2) הורדת נתונים וחישוב אינדיקטורים")
+    # בחירת period/interval לפי אופק
+    if horizon == "שבועי":
+        period, interval = "2y", "1wk"
     else:
-        # טיקר בודד – לבנות MultiIndex ידני
-        t = tickers[0] if isinstance(tickers, list) and len(tickers) else "TICKER"
-        wide = pd.concat({t: df}, axis=1)             # (ticker, field)
-        wide = wide.swaplevel(0, 1, axis=1).sort_index(axis=1)
-    return wide
+        period, interval = "6mo", "1d"
 
+    # cache של הורדות – כדי להימנע ממסך לבן בין ריצות
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def _cached_download(tix: List[str], p: str, itv: str) -> pd.DataFrame:
+        return download_price_history(tix, period=p, interval=itv)
 
-def download_price_history(
-    tickers: list[str],
-    period: str = "6mo",
-    interval: str = "1d",
-) -> pd.DataFrame:
-    """
-    מוריד היסטוריית מחירים מ-Yahoo למספר טיקרים ומחזיר DataFrame Wide:
-    עמודות MultiIndex: ('Adj Close','TEVA.TA'), ('Close','TEVA.TA'), ('Volume','TEVA.TA') ...
-    """
-    if not tickers:
-        return pd.DataFrame()
+    if ignore_cache:
+        _cached_download.clear()
 
-    # yfinance לעיתים מחזיר None כשאין נתונים; ננסה שתי קריאות עם השהייה קצרה.
-    for attempt in range(2):
-        data = yf.download(
-            tickers,
-            period=period,
-            interval=interval,
-            group_by="ticker",
-            auto_adjust=False,
-            threads=True,
-            progress=False,
-        )
-        if data is not None and not data.empty:
-            break
-        time.sleep(1.0)
+    with st.spinner("מוריד נתונים מ-Yahoo…"):
+        df_all = _cached_download(tickers, period, interval)
 
-    if data is None or data.empty:
-        return pd.DataFrame()
+    if df_all is None or df_all.empty:
+        st.error("לא נמצאו נתוני מחירים (Yahoo). נסה שוב או הפחת מספר טיקרים.")
+        st.stop()
+    else:
+        st.success(f"נתונים התקבלו בהצלחה – {df_all.shape[0]} שורות, {len(tickers)} סמלים (ייתכן שחלקם חסרים).")
 
-    # ניקוי אינדקס תאריכים בעייתיים/כפולים
-    data = data[~data.index.duplicated(keep="last")]
+# -------------------------------------------------
+# 3) דוגמת “ניקוד” פשוטה + טבלה
+#    (החלף כאן בהיגיון האמיתי שלך כשיהיה מוכן)
+# -------------------------------------------------
+with sec3:
+    st.subheader("3) ניקוד פשוט והפקת רשימת Picks")
+    # ניקוד נאיבי: שינוי יחסי של "Adj Close" על 30 הברות האחרונות
+    field = "Adj Close"
+    missing = [t for t in tickers if (field, t) not in df_all.columns]
+    used = [t for t in tickers if (field, t) in df_all.columns]
+    if len(used) == 0:
+        st.error("אין עמודות 'Adj Close' זמינות לאף טיקר.")
+        st.stop()
 
-    wide = _to_field_first_wide(data, tickers)
+    closes = df_all.loc[:, df_all.columns.get_level_values(0) == field].copy()
+    closes.columns = closes.columns.droplevel(0)  # להשאיר רק שמות טיקר
+    # שינוי יחסי אחרון (פשוט להדגמה)
+    scores = (closes.iloc[-1] / closes.iloc[-30].replace(0, pd.NA) - 1.0).dropna()
+    picks = (
+        pd.DataFrame({
+            "ticker": scores.index,
+            "score": scores.values,
+        })
+        .sort_values("score", ascending=False)
+        .head(int(top_n))
+        .reset_index(drop=True)
+    )
 
-    # שמירה רק על שדות נפוצים
-    expected_fields = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
-    have_fields = [f for f in expected_fields if f in wide.columns.get_level_values(0)]
-    if not have_fields:
-        return pd.DataFrame()
+    st.write("טבלת Picks (מדגמית):")
+    st.dataframe(picks, use_container_width=True)
 
-    wide = wide.loc[:, wide.columns.get_level_values(0).isin(have_fields)]
-    return wide
+# -------------------------------------------------
+# 4) גרף למניה נבחרת
+# -------------------------------------------------
+with sec4:
+    st.subheader("4) גרף למניה נבחרת")
+    sel = st.selectbox("בחר מניה", options=picks["ticker"].tolist())
+    data_sel = df_all.xs(key="Adj Close", level=0, axis=1).get(sel)
+    if data_sel is not None and isinstance(data_sel, pd.Series):
+        dfp = data_sel.dropna().reset_index()
+        dfp.columns = ["Date", "Adj Close"]
+        st.plotly_chart(px.line(dfp, x="Date", y="Adj Close", title=f"{sel} — מחיר"), use_container_width=True)
+    else:
+        st.info("אין נתונים לגרף עבור הבחירה.")
+
+# -------------------------------------------------
+# 5) זמן ריצה
+# -------------------------------------------------
+with sec5:
+    st.caption(f"זמן הריצה (Client): ~{int(time.time()) % 1000} (אינדיקציה בלבד)")
